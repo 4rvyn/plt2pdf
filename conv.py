@@ -12,7 +12,7 @@ import shutil
 from pathlib import Path
 import glob
 
-# -------------------- Konstanten (unverändert zur Logik) --------------------
+# -------------------- Header/Footer Konstanten ------------------------------
 PCL_HEADER = b"\x1bE\x1b%1B"   # Reset + Wechsel in HPGL/2
 PCL_FOOTER = b"\x1b%0A\x1bE"   # Zurück nach PCL + Reset
 # ----------------------------------------------------------------------------
@@ -53,7 +53,7 @@ def ensure_exists(path: str, what: str):
         sys.exit(1)
 
 
-# -------------------- Ausführungslogik pro Datei (unverändert) --------------------
+# -------------------- Ausführungslogik pro Datei ------------------------------
 
 def convert_single(
     gpcl_path: str,
@@ -64,30 +64,34 @@ def convert_single(
     margin_pts: float,
     edge_eps: float,
 ):
-    """Konvertiert genau eine PLT/HPGL-Datei ins PDF (zwei Passes)."""
+    """Konvertiert genau eine PLT/HPGL-Datei ins PDF (zwei Passes), ohne Müll in %TEMP% zu hinterlassen."""
     ensure_exists(gpcl_path, "GhostPCL")
     ensure_exists(gs_path, "Ghostscript")
     if not raw_plt_path.is_file():
         print(f"Fehlt: HPGL/PLT-Datei -> {raw_plt_path}")
         sys.exit(1)
 
-    # 0) Temporäre Wrapper-PLT (PCL-Header + HPGL + PCL-Footer)
-    temp_fd, TEMP_PLT_PATH = tempfile.mkstemp(suffix=".plt")
-    os.close(temp_fd)
-    print(f"Erstelle temporäre PCL-Wrapper-Datei: {TEMP_PLT_PATH}")
+    # Alle Zwischenstände in einen eigenen Temp-Ordner legen.
+    from pathlib import Path
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        print(f"Arbeitsordner: {tmpdir}")
 
-    try:
-        with open(TEMP_PLT_PATH, 'wb') as temp_f:
+        # 0) Wrapper-PLT schreiben (PCL-Header + HPGL + PCL-Footer)
+        temp_plt_path = tmpdir / "wrap.plt"
+        with open(temp_plt_path, "wb") as temp_f:
             temp_f.write(PCL_HEADER)
-            with open(raw_plt_path, 'rb') as raw_f:
+            with open(raw_plt_path, "rb") as raw_f:
                 temp_f.write(raw_f.read())
             temp_f.write(PCL_FOOTER)
+        print(f"Wrapper geschrieben: {temp_plt_path}")
 
-        # 1) BBox messen (identische Schleife wie zuvor)
+        # 1) Bounding Box messen
         print("Messe die Größe der Zeichnung (Bounding Box)...")
         width_px, height_px = 50000, 50000
         while True:
-            llx, lly, urx, ury = run_bbox(gpcl_path, TEMP_PLT_PATH, width_px, height_px, dpi)
+            llx, lly, urx, ury = run_bbox(gpcl_path, str(temp_plt_path), width_px, height_px, dpi)
             page_w_pts = pts_from_px(width_px, dpi)
             page_h_pts = pts_from_px(height_px, dpi)
             print(f"  Test mit Arbeitsfläche {width_px}x{height_px}px -> BBox: [{urx:.2f}, {ury:.2f}] pts")
@@ -107,12 +111,12 @@ def convert_single(
         pass1_w_px  = math.ceil(pass1_w_pts / 72.0 * dpi)
         pass1_h_px  = math.ceil(pass1_h_pts / 72.0 * dpi)
 
-        _, TEMP_PASS1_PDF = tempfile.mkstemp(suffix=".pdf")
-        print(f"Pass 1 (GhostPCL) -> {TEMP_PASS1_PDF}")
+        temp_pass1_pdf = tmpdir / "pass1.pdf"   # Wichtig: NICHT vorab anlegen!
+        print(f"Pass 1 (GhostPCL) -> {temp_pass1_pdf}")
         cmd1 = [
             gpcl_path,
             "-sDEVICE=pdfwrite",
-            f"-sOutputFile={TEMP_PASS1_PDF}",
+            f"-sOutputFile={str(temp_pass1_pdf)}",
             f"-r{dpi}",
             f"-g{pass1_w_px}x{pass1_h_px}",
             f"-dDEVICEWIDTHPOINTS={pass1_w_pts}",
@@ -120,9 +124,17 @@ def convert_single(
             "-dFIXEDMEDIA",
             "-dAutoRotatePages=/None",
             "-dNOPAUSE", "-dBATCH",
-            TEMP_PLT_PATH
+            str(temp_plt_path),
         ]
         subprocess.run(cmd1, check=True)
+
+        # Falls GhostPCL trotz gewünschtem Namen doch ein anderes tmp*.pdf erzeugt, nimm das neueste.
+        if not temp_pass1_pdf.exists():
+            candidates = sorted(tmpdir.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if not candidates:
+                raise RuntimeError("GhostPCL hat kein PDF erzeugt.")
+            temp_pass1_pdf = candidates[0]
+            print(f"Hinweis: GhostPCL erzeugte anderen Dateinamen: {temp_pass1_pdf.name}")
 
         # ---------- PASS 2: Ghostscript -> verschieben + beschneiden ----------
         draw_w_pts = urx - llx
@@ -144,25 +156,11 @@ def convert_single(
             "-dCompatibilityLevel=1.6",
             "-dNOPAUSE", "-dBATCH",
             "-c", f"<< /PageOffset [{x_off} {y_off}] >> setpagedevice",
-            "-f", TEMP_PASS1_PDF
+            "-f", str(temp_pass1_pdf),
         ]
         subprocess.run(cmd2, check=True)
         print(f"\nFertig! PDF erstellt: {out_pdf_path}")
-
-    finally:
-        # Aufräumen
-        try:
-            if os.path.exists(TEMP_PLT_PATH):
-                os.remove(TEMP_PLT_PATH)
-                print(f"Temporäre Datei gelöscht: {TEMP_PLT_PATH}")
-        except Exception:
-            pass
-        try:
-            if 'TEMP_PASS1_PDF' in locals() and os.path.exists(TEMP_PASS1_PDF):
-                os.remove(TEMP_PASS1_PDF)
-                print(f"Temporäre Datei gelöscht: {TEMP_PASS1_PDF}")
-        except Exception:
-            pass
+    # Ende with: gesamter Temp-Ordner wird automatisch gelöscht.
 
 
 # -------------------- Helfer: Pfad-Findung für Executables --------------------
